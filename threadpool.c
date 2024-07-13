@@ -66,7 +66,7 @@ ThreadPool* threadPoolCreate (int min,int max,int queueSize)
     pool -> queueFront=0;
     pool -> queueRear=0;
     pool -> shutdown=0;
-    pthread_create(&pool->managerID, NULL, manager, NULL);
+    pthread_create(&pool->managerID, NULL, manager, pool);
     for (int i = 0; i < min;i++)
     {
         pthread_create(&pool->threadIDs[i], NULL, worker,pool);

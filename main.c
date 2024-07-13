@@ -14,7 +14,7 @@ int main()
     //创建线程池
     ThreadPool* pool=threadPoolCreate(3,10,100);
     
-        for(int i=0;i,100;i++)
+        for(int i=0;i<100;i++)
         {
             int* num = (int*) malloc(sizeof(int));
             *num=i+100;
