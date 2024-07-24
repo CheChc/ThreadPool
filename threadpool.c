@@ -2,6 +2,9 @@
 #include<pthread.h>
 #include<stdlib.h>
 #include<string.h>
+#include<stdio.h>
+#include <unistd.h>
+
 const int NUMBER = 2;
 // Task
 typedef struct Task
@@ -111,14 +114,14 @@ void* worker(void *arg)
         pthread_cond_signal(&pool->notFull);//生产者的唤醒，和消费者对应
 
         pthread_mutex_unlock(&pool->mutexpool);//执行完毕，打开锁
-        printf("thread %ld start working...");
+        printf("thread %ld start working...",pthread_self());
 
         pthread_mutex_lock(&pool->mutexbusy);
         pool->busyNum++;
         pthread_mutex_unlock(&pool->mutexbusy);
 
         task.function(task.arg);
-        printf("thread %ld end working....");
+        printf("thread %ld end working....",pthread_self());
         free(task.arg);
         task.arg=NULL;
         pthread_mutex_lock(&pool->mutexbusy);
@@ -179,12 +182,13 @@ void* manager(void* arg)
         free(pool->threadIDs);
     }
     
-    free(pool);
-    pool=NULL;
+
     pthread_mutex_destroy(&pool->mutexpool);
     pthread_mutex_destroy(&pool->mutexbusy);
     pthread_cond_destroy(&pool->notEmpty);
     pthread_cond_destroy(&pool->notFull);
+    free(pool);
+    pool=NULL;
     return 0;
 }
 void threadPoolAdd(ThreadPool* pool,void (*func)(void*), void* arg)

@@ -1,0 +1,3 @@
+/Users/zhangyang/ccode/threadpool/cmake-build-debug/CMakeFiles/threadpool.dir
+/Users/zhangyang/ccode/threadpool/cmake-build-debug/CMakeFiles/edit_cache.dir
+/Users/zhangyang/ccode/threadpool/cmake-build-debug/CMakeFiles/rebuild_cache.dir

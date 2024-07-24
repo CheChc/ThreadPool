@@ -1,13 +1,13 @@
 #include<stdio.h>
-#include"threadpool.h"
 #include<pthread.h>
 #include<unistd.h>
 #include<stdlib.h>
+#include"threadpool.h"
 void taskFunc(void* arg)
 {
     int num=*(int*)arg;
-    printf("thread %ld is working,number = %d,tid = %ld\n",num,pthread_self());
-    usleep(1000);
+    printf("thread %ld is working,number = %d\n",pthread_self(),num);
+    sleep(1);
 }
 int main()
 {
