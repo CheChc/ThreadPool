@@ -68,23 +68,30 @@ ThreadPool* threadPoolCreate (int min,int max,int queueSize)
     pool -> queueSize=0;
     pool -> queueFront=0;
     pool -> queueRear=0;
+
     pool -> shutdown=0;
+
+//创建线程
     pthread_create(&pool->managerID, NULL, manager, pool);
     for (int i = 0; i < min;i++)
     {
         pthread_create(&pool->threadIDs[i], NULL, worker,pool);
     }
+    return pool;
     } while (0);
     if(pool&&pool->threadIDs)
         free(pool->threadIDs);
     if(pool&&pool->taskQ)
         free(pool->taskQ);
+    if(pool)
+        free (pool);
     
-    return pool;
+    return NULL;
 }
 void* worker(void *arg)
 {
     ThreadPool *pool = (ThreadPool *)arg;
+
     while(1)
     {
         pthread_mutex_lock(&pool->mutexpool);
@@ -96,14 +103,16 @@ void* worker(void *arg)
             {
                 pool->exitNum--;
                 pthread_mutex_unlock(&pool->mutexpool);
-                pthread_exit(NULL);
+                threadExit(pool);
             }
         }
         if(pool->shutdown)//若线程池关闭，打开锁防止死锁，退出
         {
             pthread_mutex_unlock(&pool->mutexpool);
-            pthread_exit(NULL);
+            threadExit(pool);
         }
+
+        //从任务队列中取出一个任务
         Task task;
         task.function = pool->taskQ[pool->queueFront].function;
         task.arg = pool->taskQ[pool->queueFront].arg;
@@ -189,7 +198,7 @@ void* manager(void* arg)
     pthread_cond_destroy(&pool->notFull);
     free(pool);
     pool=NULL;
-    return 0;
+    return NULL;
 }
 void threadPoolAdd(ThreadPool* pool,void (*func)(void*), void* arg)
 {
@@ -243,4 +252,18 @@ int threadPoolDestory(ThreadPool* pool)
         pthread_cond_signal(&pool->notEmpty);
     }
 	return 1;
+}
+void threadExit(ThreadPool* pool)
+{
+    pthread_t tid = pthread_self();
+    for (int i = 0; i < pool->maxNum; ++i)
+    {
+        if (pool->threadIDs[i] == tid)
+        {
+            pool->threadIDs[i] = 0;
+            printf("threadExit() called, %ld exiting...\n", tid);
+            break;
+        }
+    }
+    pthread_exit(NULL);
 }
