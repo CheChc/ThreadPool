@@ -12,7 +12,7 @@ void taskFunc(void* arg)
 int main()
 {
     //创建线程池
-    ThreadPool* pool=threadPoolCreate(3,10,100);
+    ThreadPool* pool=threadPoolCreate(5,10,100);
     
         for(int i=0;i<100;i++)
         {
