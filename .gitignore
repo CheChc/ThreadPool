@@ -1,0 +1,14 @@
+# 构建产物
+cmake-build-*/
+build/
+*.o
+*.a
+*.so
+
+# 可执行文件
+main
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,269 +1,326 @@
 #include "threadpool.h"
-#include<pthread.h>
-#include<stdlib.h>
-#include<string.h>
-#include<stdio.h>
-#include <unistd.h>
 
-const int NUMBER = 2;
-// Task
-typedef struct Task
-{
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/prctl.h>
+
+/* 单次扩容/缩容的步长（线程数） */
+#define ADJUST_STEP 2
+
+/* 管理线程的检测间隔（秒） */
+#define MANAGE_INTERVAL 2
+
+typedef struct Task {
     void (*function)(void* arg);
     void* arg;
-}Task;
-struct ThreadPool
-{
-    Task* taskQ;
-    int queueCapacity;//容量
-    int queueSize;//当前个数
-    int queueFront;//队头
-    int queueRear;//队尾
+} Task;
 
-    pthread_t managerID;//管理者线程ID
-    pthread_t* threadIDs;//工作的线程ID
-    int minNum;//最小线程数
-    int maxNum;//最大线程数
-    int busyNum;//忙的线程格式
-    int liveNum;//存货线程个数
-    int exitNum;//要销毁的线程个数
-    pthread_mutex_t mutexpool;//锁整个线程池
-    pthread_mutex_t mutexbusy;//锁busyNum
-    pthread_cond_t notFull;//任务队列是不是满了
-    pthread_cond_t notEmpty;//任务队列是不是空了 
-    int shutdown;//是否需要销毁线程 1为关闭，0为不关闭
+struct ThreadPool {
+    Task* taskQ;            /* 任务队列（环形缓冲） */
+    int queueCapacity;      /* 队列容量 */
+    int queueSize;          /* 队列当前任务数 */
+    int queueFront;         /* 队头下标 */
+    int queueRear;          /* 队尾下标 */
+
+    pthread_t managerID;    /* 管理线程 ID */
+    pthread_t* threadIDs;   /* worker 线程 ID 数组，0 表示空槽位 */
+    int minNum;             /* 最小（初始）线程数 */
+    int maxNum;             /* 最大线程数 */
+    int busyNum;            /* 忙线程数（受 mutexbusy 保护） */
+    int liveNum;            /* 存活线程数 */
+    int exitNum;            /* 待退出线程数 */
+
+    pthread_mutex_t mutexpool;  /* 保护池状态：队列、线程数、shutdown */
+    pthread_mutex_t mutexbusy;  /* 保护 busyNum */
+    pthread_cond_t notFull;     /* 队列未满（生产者等待） */
+    pthread_cond_t notEmpty;    /* 队列非空（消费者等待） */
+    pthread_cond_t manageWait;  /* 管理线程定时等待（destroy 时唤醒，避免干等 2 秒） */
+
+    int shutdown;           /* 1 = 开始销毁 */
 };
-ThreadPool* threadPoolCreate (int min,int max,int queueSize)
+
+/*
+ * 当前线程退出：把自己的槽位置 0 后退出。
+ * 调用前不得持有任何锁（内部会加锁，避免退出时锁永久不释放）。
+ */
+static void threadExit(ThreadPool* pool)
 {
-    ThreadPool* pool = (ThreadPool*)malloc(sizeof(ThreadPool));
-    do
-    {
-        if(pool == NULL)
-    {
-        printf("malloc threadpoll fail...\n");
-        break;
-    }
-    pool->threadIDs =(pthread_t*)malloc(sizeof(pthread_t)*max);
-    if(pool->threadIDs == NULL)
-    {
-        printf("malloc threadids fail...");
-        break;
-    }
-    memset(pool->threadIDs,0,sizeof(pthread_t )*max);
-    pool -> maxNum=max;
-    pool -> minNum=min;
-    pool -> busyNum=0;
-    pool -> liveNum=min;
-    pool -> exitNum=0;
-    if(pthread_mutex_init(&pool -> mutexpool,NULL)!=0 || 
-    pthread_mutex_init(&pool -> mutexbusy,NULL)!=0||
-    pthread_cond_init(&pool -> notFull,NULL)!=0||
-    pthread_cond_init(&pool -> notEmpty,NULL)!=0)
-    {
-        printf("mutex or condition init fail...");
-        break;
-    }//四个锁的检测
-    pool -> taskQ = (Task*)malloc(sizeof(Task)*queueSize);
-    pool -> queueCapacity=queueSize;
-    pool -> queueSize=0;
-    pool -> queueFront=0;
-    pool -> queueRear=0;
+    pthread_t tid = pthread_self();
 
-    pool -> shutdown=0;
-
-//创建线程
-    pthread_create(&pool->managerID, NULL, manager, pool);
-    for (int i = 0; i < min;i++)
-    {
-        pthread_create(&pool->threadIDs[i], NULL, worker,pool);
-    }
-    return pool;
-    } while (0);
-    if(pool&&pool->threadIDs)
-        free(pool->threadIDs);
-    if(pool&&pool->taskQ)
-        free(pool->taskQ);
-    if(pool)
-        free (pool);
-    
-    return NULL;
-}
-void* worker(void *arg)
-{
-    ThreadPool *pool = (ThreadPool *)arg;
-
-    while(1)
-    {
-        pthread_mutex_lock(&pool->mutexpool);
-        while(pool->queueSize==0&&!pool->shutdown)
-        {
-            //任务队列空且未关闭：阻塞
-            pthread_cond_wait(&pool->notEmpty, &pool->mutexpool);
-            if(pool->exitNum>0)
-            {
-                pool->exitNum--;
-                pthread_mutex_unlock(&pool->mutexpool);
-                threadExit(pool);
-            }
+    pthread_mutex_lock(&pool->mutexpool);
+    for (int i = 0; i < pool->maxNum; ++i) {
+        if (pool->threadIDs[i] != 0 && pthread_equal(pool->threadIDs[i], tid)) {
+            pool->threadIDs[i] = 0;
+            pool->liveNum--;
+            break;
         }
-        if(pool->shutdown)//若线程池关闭，打开锁防止死锁，退出
-        {
+    }
+    pthread_mutex_unlock(&pool->mutexpool);
+
+    pthread_exit(NULL);
+}
+
+/* 消费者线程：从队列取任务执行 */
+static void* worker(void* arg)
+{
+    ThreadPool* pool = (ThreadPool*)arg;
+    prctl(PR_SET_NAME, "tp-worker", 0, 0, 0);
+
+    for (;;) {
+        pthread_mutex_lock(&pool->mutexpool);
+
+        /* 队列空且未关闭：阻塞等待；被缩容信号唤醒时也跳出 */
+        while (pool->queueSize == 0 && !pool->shutdown) {
+            pthread_cond_wait(&pool->notEmpty, &pool->mutexpool);
+            if (pool->exitNum > 0)
+                break;
+        }
+
+        /* 缩容：队列已空时退出 */
+        if (pool->exitNum > 0 && pool->queueSize == 0) {
+            pool->exitNum--;
             pthread_mutex_unlock(&pool->mutexpool);
             threadExit(pool);
         }
 
-        //从任务队列中取出一个任务
-        Task task;
-        task.function = pool->taskQ[pool->queueFront].function;
-        task.arg = pool->taskQ[pool->queueFront].arg;
-        //移动头节点
-        pool->queueFront = (pool->queueFront + 1) % pool->queueCapacity;//数组转化为循环队列，通过求余可以实现循环功能
-        pool->queueSize--;//容量减一
+        /* 关闭且队列已空：正常退出（队列非空则继续消费完，优雅停机） */
+        if (pool->shutdown && pool->queueSize == 0) {
+            pthread_mutex_unlock(&pool->mutexpool);
+            threadExit(pool);
+        }
 
-        pthread_cond_signal(&pool->notFull);//生产者的唤醒，和消费者对应
+        /* 取出队头任务 */
+        Task task = pool->taskQ[pool->queueFront];
+        pool->queueFront = (pool->queueFront + 1) % pool->queueCapacity;
+        pool->queueSize--;
 
-        pthread_mutex_unlock(&pool->mutexpool);//执行完毕，打开锁
-        printf("thread %ld start working...",pthread_self());
+        pthread_cond_signal(&pool->notFull);
+        pthread_mutex_unlock(&pool->mutexpool);
 
+        /* 执行任务（busyNum 用独立锁，不阻塞其他消费者取任务） */
         pthread_mutex_lock(&pool->mutexbusy);
         pool->busyNum++;
         pthread_mutex_unlock(&pool->mutexbusy);
 
         task.function(task.arg);
-        printf("thread %ld end working....",pthread_self());
-        free(task.arg);
-        task.arg=NULL;
+
         pthread_mutex_lock(&pool->mutexbusy);
         pool->busyNum--;
         pthread_mutex_unlock(&pool->mutexbusy);
     }
     return NULL;
 }
-void* manager(void* arg)
-{
-    ThreadPool *pool=(ThreadPool*)arg;
-    while (!pool->shutdown)
-    {
-        sleep(3);//每三秒检测一次
-        //取出线程池中任务的数量和当前任务
-        pthread_mutex_lock(&pool->mutexpool);
-        int queueSize=pool->queueSize;
-        int liveNum=pool->liveNum;
-        pthread_mutex_unlock(&pool->mutexpool);
-        //取出忙的线程
-        pthread_mutex_lock(&pool->mutexbusy);//用专用的锁，提高工作效率，不需要锁整个线程池
-        int busyNum=pool->busyNum;
-        pthread_mutex_unlock(&pool->mutexbusy);
-        //添加线程
-        //任务个数＞存活线程数 &&存活线程数＜最大线程数
-        if(queueSize>liveNum&&liveNum<pool->maxNum)
-        {
-            int counter=0;
-            pthread_mutex_lock(&pool->mutexpool);
-            for(int i=0;i<pool->maxNum&&counter<NUMBER&&pool->liveNum<pool->maxNum;i++)
-            {   
-                if(pool->threadIDs[i]==0)
-                pthread_create(pool->threadIDs[i],NULL,worker,pool);
-                counter++;
-                pool->liveNum++;
-            }
-            pthread_mutex_unlock(&pool->mutexpool);
-        }
-        //销毁线程
-        //忙的线程*2＜存活线程数&&存活线程数＞最小线程数
-        if(queueSize*2<liveNum&&liveNum>pool->minNum)
-        {
-            pthread_mutex_lock(&pool->mutexpool);
-            pool->exitNum=NUMBER;
-            pthread_mutex_unlock(&pool->mutexpool);
-            for(int i=0;i<NUMBER;i++)
-            {
-                pthread_cond_signal(&pool->notEmpty);
-            }
-        }
-    }
-    if(pool->taskQ)
-    {
-        free(pool->taskQ);
-    }
-    if(pool->threadIDs)
-    {
-        free(pool->threadIDs);
-    }
-    
 
-    pthread_mutex_destroy(&pool->mutexpool);
-    pthread_mutex_destroy(&pool->mutexbusy);
-    pthread_cond_destroy(&pool->notEmpty);
-    pthread_cond_destroy(&pool->notFull);
-    free(pool);
-    pool=NULL;
+/* 管理线程：周期性检查负载，动态扩缩容。退出时不清理资源（由 Destroy 统一清理） */
+static void* manager(void* arg)
+{
+    ThreadPool* pool = (ThreadPool*)arg;
+    prctl(PR_SET_NAME, "tp-manager", 0, 0, 0);
+
+    for (;;) {
+        /* 定时等待（可被 destroy 提前唤醒），避免 destroy 时干等整个间隔 */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += MANAGE_INTERVAL;
+
+        pthread_mutex_lock(&pool->mutexpool);
+        int woken = pthread_cond_timedwait(&pool->manageWait, &pool->mutexpool, &ts);
+        int shutdown = pool->shutdown;
+        int queueSize = pool->queueSize;
+        int liveNum = pool->liveNum;
+        pthread_mutex_unlock(&pool->mutexpool);
+
+        if (shutdown)
+            break;
+        if (woken != ETIMEDOUT)
+            continue;   /* 非超时唤醒（destroy 广播），shutdown 已检查 */
+
+        pthread_mutex_lock(&pool->mutexbusy);
+        int busyNum = pool->busyNum;
+        pthread_mutex_unlock(&pool->mutexbusy);
+
+        int idleNum = liveNum - busyNum;    /* 空闲线程数 */
+
+        /* 扩容：队列里有排队任务且线程数未达上限 */
+        if (queueSize > idleNum && liveNum < pool->maxNum) {
+            pthread_mutex_lock(&pool->mutexpool);
+            int toCreate = pool->maxNum - pool->liveNum;
+            if (toCreate > ADJUST_STEP)
+                toCreate = ADJUST_STEP;
+            for (int i = 0, created = 0;
+                 i < pool->maxNum && created < toCreate; ++i) {
+                if (pool->threadIDs[i] == 0) {
+                    pthread_t tid;
+                    if (pthread_create(&tid, NULL, worker, pool) == 0) {
+                        pool->threadIDs[i] = tid;
+                        pool->liveNum++;
+                        created++;
+                    }
+                }
+            }
+            pthread_mutex_unlock(&pool->mutexpool);
+        }
+
+        /* 缩容：空闲线程比最小线程数多出至少一步长 */
+        if (idleNum - pool->minNum >= ADJUST_STEP) {
+            int toExit = idleNum - pool->minNum;
+            if (toExit > ADJUST_STEP)
+                toExit = ADJUST_STEP;
+
+            pthread_mutex_lock(&pool->mutexpool);
+            pool->exitNum += toExit;
+            /* 锁内广播，确保所有空闲 worker 都能被唤醒并退出 */
+            pthread_cond_broadcast(&pool->notEmpty);
+            pthread_mutex_unlock(&pool->mutexpool);
+        }
+    }
     return NULL;
 }
-void threadPoolAdd(ThreadPool* pool,void (*func)(void*), void* arg)
+
+ThreadPool* threadPoolCreate(int min, int max, int queueSize)
 {
+    if (min <= 0 || max < min || queueSize <= 0)
+        return NULL;
+
+    ThreadPool* pool = calloc(1, sizeof(ThreadPool));
+    if (pool == NULL)
+        return NULL;
+
+    pool->threadIDs = calloc(max, sizeof(pthread_t));   /* calloc 保证空槽位为 0 */
+    pool->taskQ = calloc(queueSize, sizeof(Task));
+    if (pool->threadIDs == NULL || pool->taskQ == NULL) {
+        free(pool->threadIDs);
+        free(pool->taskQ);
+        free(pool);
+        return NULL;
+    }
+
+    pool->minNum = min;
+    pool->maxNum = max;
+    pool->queueCapacity = queueSize;
+    pool->shutdown = 0;
+
+    if (pthread_mutex_init(&pool->mutexpool, NULL) != 0 ||
+        pthread_mutex_init(&pool->mutexbusy, NULL) != 0 ||
+        pthread_cond_init(&pool->notFull, NULL) != 0 ||
+        pthread_cond_init(&pool->notEmpty, NULL) != 0 ||
+        pthread_cond_init(&pool->manageWait, NULL) != 0) {
+        free(pool->threadIDs);
+        free(pool->taskQ);
+        free(pool);
+        return NULL;
+    }
+
+    if (pthread_create(&pool->managerID, NULL, manager, pool) != 0) {
+        pthread_mutex_destroy(&pool->mutexpool);
+        pthread_mutex_destroy(&pool->mutexbusy);
+        pthread_cond_destroy(&pool->notFull);
+        pthread_cond_destroy(&pool->notEmpty);
+        pthread_cond_destroy(&pool->manageWait);
+        free(pool->threadIDs);
+        free(pool->taskQ);
+        free(pool);
+        return NULL;
+    }
+
+    /* 创建初始 worker（部分失败不致命，管理线程会按需补齐） */
+    for (int i = 0; i < min; ++i) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, worker, pool) == 0) {
+            pool->threadIDs[i] = tid;
+            pool->liveNum++;
+        }
+    }
+    return pool;
+}
+
+int threadPoolAdd(ThreadPool* pool, void (*func)(void*), void* arg)
+{
+    if (pool == NULL || func == NULL)
+        return -1;
+
     pthread_mutex_lock(&pool->mutexpool);
-    while(pool->queueSize == pool->queueCapacity&&!pool->shutdown)
-    {
-        //阻塞生产者线程
-        pthread_cond_wait(&pool->notFull,&pool->mutexpool);
+
+    /* 队列满且未关闭：阻塞等待消费者腾出空间 */
+    while (pool->queueSize == pool->queueCapacity && !pool->shutdown) {
+        pthread_cond_wait(&pool->notFull, &pool->mutexpool);
     }
-    //如果关闭，则解锁并退出
-    if(pool->shutdown)
-    {
+
+    if (pool->shutdown) {
         pthread_mutex_unlock(&pool->mutexpool);
-        return;
+        return -1;
     }
-    //添加任务
-    pool->taskQ[pool->queueRear].function=func;
-    pool->taskQ[pool->queueRear].arg=arg;
-    pool->queueRear=(pool->queueRear+1)%pool->queueCapacity;
+
+    pool->taskQ[pool->queueRear].function = func;
+    pool->taskQ[pool->queueRear].arg = arg;
+    pool->queueRear = (pool->queueRear + 1) % pool->queueCapacity;
     pool->queueSize++;
 
     pthread_cond_signal(&pool->notEmpty);
     pthread_mutex_unlock(&pool->mutexpool);
-	return ;
+    return 0;
 }
-int threadPolBusyNum(ThreadPool* pool)
+
+int threadPoolBusyNum(ThreadPool* pool)
 {
-    pthread_mutex_lock(&pool->busyNum);
-    int busyNum=pool->busyNum;
-    pthread_mutex_unlock(&pool->busyNum);
+    if (pool == NULL)
+        return -1;
+
+    pthread_mutex_lock(&pool->mutexbusy);
+    int busyNum = pool->busyNum;
+    pthread_mutex_unlock(&pool->mutexbusy);
     return busyNum;
 }
-int threadPolAliveNum(ThreadPool* pool)
+
+int threadPoolAliveNum(ThreadPool* pool)
 {
+    if (pool == NULL)
+        return -1;
+
     pthread_mutex_lock(&pool->mutexpool);
-    int aliveNum=pool->liveNum;
+    int aliveNum = pool->liveNum;
     pthread_mutex_unlock(&pool->mutexpool);
     return aliveNum;
 }
-int threadPoolDestory(ThreadPool* pool)
+
+int threadPoolDestroy(ThreadPool* pool)
 {
-    if(pool == NULL)
-    return -1;
-    //第一步，关掉线程池
-    pool->shutdown=1;
-    //阻塞回收管理者
-    pthread_join(pool->managerID,NULL);
-    //唤醒阻塞的消费者
-    for(int i=0;i<pool->liveNum;i++)
-    {
-        pthread_cond_signal(&pool->notEmpty);
+    if (pool == NULL)
+        return -1;
+
+    /* 1. 置关闭标志，唤醒所有阻塞的 worker 和生产者 */
+    pthread_mutex_lock(&pool->mutexpool);
+    if (pool->shutdown) {               /* 防止重复销毁 */
+        pthread_mutex_unlock(&pool->mutexpool);
+        return -1;
     }
-	return 1;
-}
-void threadExit(ThreadPool* pool)
-{
-    pthread_t tid = pthread_self();
-    for (int i = 0; i < pool->maxNum; ++i)
-    {
-        if (pool->threadIDs[i] == tid)
-        {
-            pool->threadIDs[i] = 0;
-            printf("threadExit() called, %ld exiting...\n", tid);
-            break;
-        }
+    pool->shutdown = 1;
+    pthread_cond_broadcast(&pool->notEmpty);    /* 唤醒 worker */
+    pthread_cond_broadcast(&pool->notFull);     /* 唤醒阻塞在 Add 的生产者 */
+    pthread_cond_broadcast(&pool->manageWait);  /* 唤醒 manager，立即退出 */
+    pthread_mutex_unlock(&pool->mutexpool);
+
+    /* 2. 回收管理线程（它自己退出，不清理资源） */
+    pthread_join(pool->managerID, NULL);
+
+    /* 3. 回收所有 worker（优雅停机：队列中剩余任务会被消费完） */
+    for (int i = 0; i < pool->maxNum; ++i) {
+        if (pool->threadIDs[i] != 0)
+            pthread_join(pool->threadIDs[i], NULL);
     }
-    pthread_exit(NULL);
+
+    /* 4. 释放资源（此时已无任何线程访问 pool） */
+    free(pool->taskQ);
+    free(pool->threadIDs);
+    pthread_mutex_destroy(&pool->mutexpool);
+    pthread_mutex_destroy(&pool->mutexbusy);
+    pthread_cond_destroy(&pool->notFull);
+    pthread_cond_destroy(&pool->notEmpty);
+    pthread_cond_destroy(&pool->manageWait);
+    free(pool);
+    return 0;
 }
