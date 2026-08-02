@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -22,6 +23,12 @@ typedef struct Task {
     void* arg;
 } Task;
 
+/* worker 线程入参：携带池指针与自身在 threadIDs 中的槽位，退出时 O(1) 置零 */
+typedef struct WorkerArg {
+    ThreadPool* pool;
+    pthread_t* slot;
+} WorkerArg;
+
 struct ThreadPool {
     Task* taskQ;            /* 任务队列（环形缓冲） */
     int queueCapacity;      /* 队列容量 */
@@ -33,7 +40,7 @@ struct ThreadPool {
     pthread_t* threadIDs;   /* worker 线程 ID 数组，0 表示空槽位 */
     int minNum;             /* 最小（初始）线程数 */
     int maxNum;             /* 最大线程数 */
-    int busyNum;            /* 忙线程数（受 mutexbusy 保护） */
+    atomic_int busyNum;     /* 忙线程数（原子计数，无需独立锁） */
     int liveNum;            /* 存活线程数 */
     int exitNum;            /* 待退出线程数 */
 
@@ -45,7 +52,6 @@ struct ThreadPool {
     int monotonic;          /* 1 = manageWait 使用 CLOCK_MONOTONIC */
 
     pthread_mutex_t mutexpool;  /* 保护池状态：队列、线程数、pending、closed/shutdown */
-    pthread_mutex_t mutexbusy;  /* 保护 busyNum */
     pthread_cond_t notFull;     /* 队列未满（生产者等待） */
     pthread_cond_t notEmpty;    /* 队列非空（消费者等待） */
     pthread_cond_t manageWait;  /* 管理线程定时等待（destroy 时唤醒，避免干等 2 秒） */
@@ -56,19 +62,13 @@ struct ThreadPool {
 /*
  * 当前线程退出：把自己的槽位置 0 后退出。
  * 调用前不得持有任何锁（内部会加锁，避免退出时锁永久不释放）。
+ * slot 指向创建时分配的槽位（threadIDs 中的元素），O(1) 置零，无需扫描。
  */
-static void threadExit(ThreadPool* pool)
+static void threadExit(ThreadPool* pool, pthread_t* slot)
 {
-    pthread_t tid = pthread_self();
-
     pthread_mutex_lock(&pool->mutexpool);
-    for (int i = 0; i < pool->maxNum; ++i) {
-        if (pool->threadIDs[i] != 0 && pthread_equal(pool->threadIDs[i], tid)) {
-            pool->threadIDs[i] = 0;
-            pool->liveNum--;
-            break;
-        }
-    }
+    *slot = 0;
+    pool->liveNum--;
     pthread_mutex_unlock(&pool->mutexpool);
 
     pthread_exit(NULL);
@@ -77,7 +77,9 @@ static void threadExit(ThreadPool* pool)
 /* 消费者线程：从队列取任务执行 */
 static void* worker(void* arg)
 {
-    ThreadPool* pool = (ThreadPool*)arg;
+    WorkerArg* wa = (WorkerArg*)arg;
+    ThreadPool* pool = wa->pool;
+    pthread_t* selfSlot = wa->slot;
 #ifdef __linux__
     prctl(PR_SET_NAME, "tp-worker", 0, 0, 0);
 #elif defined(__APPLE__)
@@ -87,24 +89,27 @@ static void* worker(void* arg)
     for (;;) {
         pthread_mutex_lock(&pool->mutexpool);
 
-        /* 队列空且未关闭：阻塞等待；被缩容信号唤醒时也跳出 */
-        while (pool->queueSize == 0 && !pool->shutdown) {
+        /*
+         * 队列空且未关闭：阻塞等待。
+         * exitNum == 0 并入等待条件：空闲 worker 被标记缩容后主动退出，
+         * 不再依赖外部 signal 唤醒（避免缩容信号丢失导致线程卡死）。
+         */
+        while (pool->queueSize == 0 && !pool->shutdown && pool->exitNum == 0)
             pthread_cond_wait(&pool->notEmpty, &pool->mutexpool);
-            if (pool->exitNum > 0)
-                break;
-        }
 
         /* 缩容：队列已空时退出 */
         if (pool->exitNum > 0 && pool->queueSize == 0) {
             pool->exitNum--;
             pthread_mutex_unlock(&pool->mutexpool);
-            threadExit(pool);
+            free(wa);
+            threadExit(pool, selfSlot);
         }
 
         /* 关闭且队列已空：正常退出（队列非空则继续消费完，优雅停机） */
         if (pool->shutdown && pool->queueSize == 0) {
             pthread_mutex_unlock(&pool->mutexpool);
-            threadExit(pool);
+            free(wa);
+            threadExit(pool, selfSlot);
         }
 
         /* 取出队头任务 */
@@ -115,16 +120,12 @@ static void* worker(void* arg)
         pthread_cond_signal(&pool->notFull);
         pthread_mutex_unlock(&pool->mutexpool);
 
-        /* 执行任务（busyNum 用独立锁，不阻塞其他消费者取任务） */
-        pthread_mutex_lock(&pool->mutexbusy);
-        pool->busyNum++;
-        pthread_mutex_unlock(&pool->mutexbusy);
+        /* 执行任务（busyNum 原子计数，不阻塞其他消费者取任务） */
+        atomic_fetch_add(&pool->busyNum, 1);
 
         task.function(task.arg);
 
-        pthread_mutex_lock(&pool->mutexbusy);
-        pool->busyNum--;
-        pthread_mutex_unlock(&pool->mutexbusy);
+        atomic_fetch_sub(&pool->busyNum, 1);
 
         /* 任务完成会计：pending 归零时广播 allDone，唤醒 WaitAll */
         pthread_mutex_lock(&pool->mutexpool);
@@ -176,9 +177,7 @@ static void* manager(void* arg)
         if (woken != ETIMEDOUT)
             continue;   /* 非超时唤醒（destroy 广播），shutdown 已检查 */
 
-        pthread_mutex_lock(&pool->mutexbusy);
-        int busyNum = pool->busyNum;
-        pthread_mutex_unlock(&pool->mutexbusy);
+        int busyNum = atomic_load(&pool->busyNum);
 
         int idleNum = liveNum - busyNum;    /* 空闲线程数（快照，仅作启发式） */
 
@@ -191,11 +190,18 @@ static void* manager(void* arg)
             for (int i = 0, created = 0;
                  i < pool->maxNum && created < toCreate; ++i) {
                 if (pool->threadIDs[i] == 0) {
+                    WorkerArg* wa = malloc(sizeof(WorkerArg));
+                    if (wa == NULL)
+                        continue;
+                    wa->pool = pool;
+                    wa->slot = &pool->threadIDs[i];
                     pthread_t tid;
-                    if (pthread_create(&tid, NULL, worker, pool) == 0) {
+                    if (pthread_create(&tid, NULL, worker, wa) == 0) {
                         pool->threadIDs[i] = tid;
                         pool->liveNum++;
                         created++;
+                    } else {
+                        free(wa);
                     }
                 }
             }
@@ -241,12 +247,14 @@ ThreadPool* threadPoolCreate(int min, int max, int queueSize)
     pool->minNum = min;
     pool->maxNum = max;
     pool->queueCapacity = queueSize;
+    atomic_init(&pool->busyNum, 0);
 
-    /* manageWait 优先使用单调时钟；平台不支持时退回默认（CLOCK_REALTIME） */
+    /* manageWait 优先使用单调时钟；pthread_condattr_setclock 为 Linux 专属，
+     * 其他平台（macOS/MinGW）退回默认时钟（CLOCK_REALTIME） */
     pthread_condattr_t cattr;
     int haveAttr = 0;
     int mono = 0;
-#ifdef CLOCK_MONOTONIC
+#ifdef __linux__
     if (pthread_condattr_init(&cattr) == 0) {
         haveAttr = 1;
         mono = (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) == 0);
@@ -255,14 +263,12 @@ ThreadPool* threadPoolCreate(int min, int max, int queueSize)
     pool->monotonic = mono;
 
     /* 分步初始化，失败时精确清理已成功的部分，避免资源泄漏 */
-    int have_pool_mutex = 0, have_busy_mutex = 0;
+    int have_pool_mutex = 0;
     int have_notfull = 0, have_notempty = 0, have_mgmt = 0;
     int have_alldone = 0, have_noprod = 0;
 
     if (pthread_mutex_init(&pool->mutexpool, NULL) != 0) goto init_fail;
     have_pool_mutex = 1;
-    if (pthread_mutex_init(&pool->mutexbusy, NULL) != 0) goto init_fail;
-    have_busy_mutex = 1;
     if (pthread_cond_init(&pool->notFull, NULL) != 0) goto init_fail;
     have_notfull = 1;
     if (pthread_cond_init(&pool->notEmpty, NULL) != 0) goto init_fail;
@@ -282,7 +288,6 @@ ThreadPool* threadPoolCreate(int min, int max, int queueSize)
         pthread_cond_destroy(&pool->manageWait);
         pthread_cond_destroy(&pool->notEmpty);
         pthread_cond_destroy(&pool->notFull);
-        pthread_mutex_destroy(&pool->mutexbusy);
         pthread_mutex_destroy(&pool->mutexpool);
         free(pool->threadIDs);
         free(pool->taskQ);
@@ -292,10 +297,17 @@ ThreadPool* threadPoolCreate(int min, int max, int queueSize)
 
     /* 创建初始 worker（部分失败不致命，管理线程会按需补齐） */
     for (int i = 0; i < min; ++i) {
+        WorkerArg* wa = malloc(sizeof(WorkerArg));
+        if (wa == NULL)
+            break;
+        wa->pool = pool;
+        wa->slot = &pool->threadIDs[i];
         pthread_t tid;
-        if (pthread_create(&tid, NULL, worker, pool) == 0) {
+        if (pthread_create(&tid, NULL, worker, wa) == 0) {
             pool->threadIDs[i] = tid;
             pool->liveNum++;
+        } else {
+            free(wa);
         }
     }
     return pool;
@@ -306,7 +318,6 @@ init_fail:
     if (have_mgmt) pthread_cond_destroy(&pool->manageWait);
     if (have_notempty) pthread_cond_destroy(&pool->notEmpty);
     if (have_notfull) pthread_cond_destroy(&pool->notFull);
-    if (have_busy_mutex) pthread_mutex_destroy(&pool->mutexbusy);
     if (have_pool_mutex) pthread_mutex_destroy(&pool->mutexpool);
     if (haveAttr) pthread_condattr_destroy(&cattr);
     free(pool->threadIDs);
@@ -403,10 +414,7 @@ int threadPoolBusyNum(ThreadPool* pool)
     if (pool == NULL)
         return -1;
 
-    pthread_mutex_lock(&pool->mutexbusy);
-    int busyNum = pool->busyNum;
-    pthread_mutex_unlock(&pool->mutexbusy);
-    return busyNum;
+    return atomic_load(&pool->busyNum);
 }
 
 int threadPoolAliveNum(ThreadPool* pool)
@@ -486,33 +494,23 @@ int threadPoolDestroy(ThreadPool* pool)
      *    锁内快照线程槽位后再 join：原实现无锁读 threadIDs，与 threadExit
      *    加锁置零形成数据竞争（C11 UB，pthread_t 非标量平台上可能读到撕裂值）。
      *    join 必须在锁外进行，否则 worker 退出时需要拿同一把锁而卡死。
+     *    快照用定长栈数组（maxNum 固定），避免 OOM 时回退到无锁读。
      */
-    pthread_t* joinList = malloc((size_t)pool->maxNum * sizeof(pthread_t));
-    if (joinList != NULL) {
-        int n = 0;
-        pthread_mutex_lock(&pool->mutexpool);
-        for (int i = 0; i < pool->maxNum; ++i)
-            if (pool->threadIDs[i] != 0)
-                joinList[n++] = pool->threadIDs[i];
-        pthread_mutex_unlock(&pool->mutexpool);
+    pthread_t joinList[pool->maxNum];
+    int n = 0;
+    pthread_mutex_lock(&pool->mutexpool);
+    for (int i = 0; i < pool->maxNum; ++i)
+        if (pool->threadIDs[i] != 0)
+            joinList[n++] = pool->threadIDs[i];
+    pthread_mutex_unlock(&pool->mutexpool);
 
-        for (int j = 0; j < n; ++j)
-            pthread_join(joinList[j], NULL);
-        free(joinList);
-    } else {
-        /* 极端（OOM）回退：仅作兜底，仍保留原行为 */
-        for (int i = 0; i < pool->maxNum; ++i) {
-            pthread_t tid = pool->threadIDs[i];
-            if (tid != 0)
-                pthread_join(tid, NULL);
-        }
-    }
+    for (int j = 0; j < n; ++j)
+        pthread_join(joinList[j], NULL);
 
     /* 5. 释放资源（此时已无任何线程访问 pool） */
     free(pool->taskQ);
     free(pool->threadIDs);
     pthread_mutex_destroy(&pool->mutexpool);
-    pthread_mutex_destroy(&pool->mutexbusy);
     pthread_cond_destroy(&pool->notFull);
     pthread_cond_destroy(&pool->notEmpty);
     pthread_cond_destroy(&pool->manageWait);

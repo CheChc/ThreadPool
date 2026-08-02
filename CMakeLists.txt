@@ -12,14 +12,17 @@ find_package(Threads REQUIRED)
 
 set(TP_SOURCES threadpool.c threadpool.h)
 
+# -Wall -Wextra 是 GCC/Clang 专属选项，MSVC 不识别
+set(TP_WARNING_FLAGS $<$<C_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
+
 add_executable(threadpool main.c ${TP_SOURCES})
 target_link_libraries(threadpool PRIVATE Threads::Threads)
-target_compile_options(threadpool PRIVATE -Wall -Wextra)
+target_compile_options(threadpool PRIVATE ${TP_WARNING_FLAGS})
 
 # 压力测试：cmake --build . && ctest（或直接运行 ./stress）
 add_executable(stress stress.c ${TP_SOURCES})
 target_link_libraries(stress PRIVATE Threads::Threads)
-target_compile_options(stress PRIVATE -Wall -Wextra)
+target_compile_options(stress PRIVATE ${TP_WARNING_FLAGS})
 
 enable_testing()
 add_test(NAME stress COMMAND stress)
